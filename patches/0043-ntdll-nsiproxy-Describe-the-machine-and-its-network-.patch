@@ -1,0 +1,390 @@
+From 323377a1907f6c300c1e29543e26f8f390b4092d Mon Sep 17 00:00:00 2001
+From: Jabern <Jabern@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 16:10:43 +0300
+Subject: [PATCH 43/43] ntdll, nsiproxy: Describe the machine and its network
+ when Android hides them.
+
+Android apps get no DMI (/sys/class/dmi/id), no dbus machine-id, no
+SIOCGIFHWADDR, no netlink (if_nameindex, getifaddrs) and no /proc/net. Rhino's
+licensing then failed with a NullReferenceException (empty UUID/serials/MAC).
+
+- ntdll: DMI files and the machine-id fall back to $WINE_DMI_DIR/<name>.
+- nsiproxy: stable locally administered MAC (machine-id + interface name) when
+  SIOCGIFHWADDR is denied; interfaces and IPv4 addresses from SIOCGIFCONF when
+  netlink is denied; an unreadable /proc/net/route reads as empty.
+
+All fallbacks only run when the normal Linux call fails with EACCES/EPERM or
+the file is missing, so regular Linux builds behave as before.
+---
+ dlls/nsiproxy.sys/ip.c           |  23 +++---
+ dlls/nsiproxy.sys/ndis.c         | 124 +++++++++++++++++++++++++++++++
+ dlls/nsiproxy.sys/tcp.c          |   6 +-
+ dlls/nsiproxy.sys/unix_private.h |   3 +
+ dlls/ntdll/unix/system.c         |  25 ++++++-
+ 5 files changed, 166 insertions(+), 15 deletions(-)
+
+diff --git a/dlls/nsiproxy.sys/ip.c b/dlls/nsiproxy.sys/ip.c
+index 6c4d5808..ed65cb1a 100644
+--- a/dlls/nsiproxy.sys/ip.c
++++ b/dlls/nsiproxy.sys/ip.c
+@@ -24,6 +24,7 @@
+ 
+ #include "config.h"
+ #include <stdarg.h>
++#include <errno.h>
+ #include <sys/types.h>
+ #include <sys/socket.h>
+ 
+@@ -831,7 +832,7 @@ static NTSTATUS ip_interface_fill( UINT fam, const char *unix_name, void *key_da
+     UINT num = 0, scope_id = 0xffffffff;
+     NET_LUID luid;
+ 
+-    if (getifaddrs( &addrs )) return STATUS_NO_MORE_ENTRIES;
++    if (nsi_getifaddrs( &addrs )) return STATUS_NO_MORE_ENTRIES;
+ 
+     if (fam == AF_INET6) addr_scopes = get_ipv6_addr_scope_table( &addr_scopes_size );
+ 
+@@ -932,7 +933,7 @@ static NTSTATUS ip_interface_fill( UINT fam, const char *unix_name, void *key_da
+         }
+         if (!count)
+         {
+-            freeifaddrs( addrs );
++            nsi_freeifaddrs( addrs );
+             free( addr_scopes );
+             return STATUS_SUCCESS;
+         }
+@@ -942,7 +943,7 @@ static NTSTATUS ip_interface_fill( UINT fam, const char *unix_name, void *key_da
+         if (dyn) ++dyn;
+         if (stat) ++stat;
+     }
+-    freeifaddrs( addrs );
++    nsi_freeifaddrs( addrs );
+     free( addr_scopes );
+ 
+     if (!count) return STATUS_NOT_FOUND;
+@@ -1062,7 +1063,7 @@ static NTSTATUS ip_unicast_enumerate_all( int family, void *key_data, UINT key_s
+     TRACE( "%p %d %p %d %p %d %p %d %p\n", key_data, key_size, rw_data, rw_size,
+            dynamic_data, dynamic_size, static_data, static_size, count );
+ 
+-    if (getifaddrs( &addrs )) return STATUS_NO_MORE_ENTRIES;
++    if (nsi_getifaddrs( &addrs )) return STATUS_NO_MORE_ENTRIES;
+ 
+     for (entry = addrs; entry; entry = entry->ifa_next)
+     {
+@@ -1079,7 +1080,7 @@ static NTSTATUS ip_unicast_enumerate_all( int family, void *key_data, UINT key_s
+         num++;
+     }
+ 
+-    freeifaddrs( addrs );
++    nsi_freeifaddrs( addrs );
+ 
+     if (!want_data || num <= *count) *count = num;
+     else status = STATUS_BUFFER_OVERFLOW;
+@@ -1119,7 +1120,7 @@ static NTSTATUS ip_unicast_get_all_parameters( const void *key, UINT key_size, v
+ 
+     if (!convert_luid_to_unix_name( &key6->luid, &unix_name )) return STATUS_NOT_FOUND;
+ 
+-    if (getifaddrs( &addrs )) return STATUS_NO_MORE_ENTRIES;
++    if (nsi_getifaddrs( &addrs )) return STATUS_NO_MORE_ENTRIES;
+ 
+     for (entry = addrs; entry; entry = entry->ifa_next)
+     {
+@@ -1136,7 +1137,7 @@ static NTSTATUS ip_unicast_get_all_parameters( const void *key, UINT key_size, v
+         break;
+     }
+ 
+-    freeifaddrs( addrs );
++    nsi_freeifaddrs( addrs );
+     return status;
+ }
+ 
+@@ -1511,7 +1512,7 @@ static NTSTATUS ipv4_forward_enumerate_all( void *key_data, UINT key_size, void
+         FILE *fp;
+ 
+         /* Loopback routes are not present in /proc/net/routes, add those explicitly. */
+-        if (getifaddrs( &addrs )) return STATUS_NO_MORE_ENTRIES;
++        if (nsi_getifaddrs( &addrs )) return STATUS_NO_MORE_ENTRIES;
+         for (ifentry = addrs; ifentry; ifentry = ifentry->ifa_next)
+         {
+             if (!(ifentry->ifa_flags & IFF_LOOPBACK)) continue;
+@@ -1546,9 +1547,11 @@ static NTSTATUS ipv4_forward_enumerate_all( void *key_data, UINT key_size, void
+             num++;
+             break;
+         }
+-        freeifaddrs( addrs );
++        nsi_freeifaddrs( addrs );
+ 
+-        if (!(fp = fopen( "/proc/net/route", "r" ))) return STATUS_NOT_SUPPORTED;
++        /* Android apps may not read /proc/net: keep the routes found so far */
++        if (!(fp = fopen( "/proc/net/route", "r" )) && (errno != EACCES || !(fp = fopen( "/dev/null", "r" ))))
++            return STATUS_NOT_SUPPORTED;
+ 
+         /* skip header line */
+         fgets( buf, sizeof(buf), fp );
+diff --git a/dlls/nsiproxy.sys/ndis.c b/dlls/nsiproxy.sys/ndis.c
+index 5dde1724..20c5a589 100644
+--- a/dlls/nsiproxy.sys/ndis.c
++++ b/dlls/nsiproxy.sys/ndis.c
+@@ -30,6 +30,10 @@
+ #include <sys/ioctl.h>
+ #include <unistd.h>
+ #include <errno.h>
++#include <fcntl.h>
++#include <ifaddrs.h>
++#include <limits.h>
++#include <stdlib.h>
+ 
+ #ifdef HAVE_NET_IF_H
+ #include <net/if.h>
+@@ -126,6 +130,31 @@ static struct if_entry *find_entry_from_luid( const NET_LUID *luid )
+ }
+ 
+ #if defined (SIOCGIFHWADDR) && defined (HAVE_STRUCT_IFREQ_IFR_HWADDR)
++/* A locally administered unicast address, stable for this machine and interface. */
++static void make_local_mac( const char *name, BYTE *addr )
++{
++    UINT64 hash = 0xcbf29ce484222325ull;
++    char id[64];
++    int fd, len = 0, i;
++
++    const char *dir = getenv( "WINE_DMI_DIR" );
++    char path[PATH_MAX];
++
++    fd = open( "/etc/machine-id", O_RDONLY );
++    if (fd == -1 && dir && snprintf( path, sizeof(path), "%s/machine-id", dir ) < sizeof(path))
++        fd = open( path, O_RDONLY );
++    if (fd != -1)
++    {
++        if ((len = read( fd, id, sizeof(id) )) < 0) len = 0;
++        close( fd );
++    }
++    for (i = 0; i < len; i++) hash = (hash ^ (BYTE)id[i]) * 0x100000001b3ull;
++    for (i = 0; name[i]; i++) hash = (hash ^ (BYTE)name[i]) * 0x100000001b3ull;
++
++    addr[0] = 0x02;
++    for (i = 1; i < ETH_ALEN; i++) addr[i] = hash >> (8 * i);
++}
++
+ static NTSTATUS if_get_physical( const char *name, UINT *type, IF_PHYSICAL_ADDRESS *phys_addr )
+ {
+     int fd, size, i;
+@@ -160,6 +189,19 @@ static NTSTATUS if_get_physical( const char *name, UINT *type, IF_PHYSICAL_ADDRE
+ 
+     if (ioctl( fd, SIOCGIFHWADDR, &ifr ))
+     {
++        if ((errno == EACCES || errno == EPERM) && !ioctl( fd, SIOCGIFFLAGS, &ifr ))
++        {
++            /* Android hides hardware addresses from apps; make up a stable one */
++            if (ifr.ifr_flags & IFF_LOOPBACK) *type = MIB_IF_TYPE_LOOPBACK;
++            else if (ifr.ifr_flags & IFF_POINTOPOINT) *type = MIB_IF_TYPE_PPP;
++            else
++            {
++                *type = MIB_IF_TYPE_ETHERNET;
++                phys_addr->Length = ETH_ALEN;
++                make_local_mac( name, phys_addr->Address );
++            }
++            goto wireless;
++        }
+         ret = STATUS_DEVICE_DATA_ERROR;
+         goto err;
+     }
+@@ -176,6 +218,7 @@ static NTSTATUS if_get_physical( const char *name, UINT *type, IF_PHYSICAL_ADDRE
+     if (*type == MIB_IF_TYPE_OTHER && !ioctl( fd, SIOCGIFFLAGS, &ifr ) && ifr.ifr_flags & IFF_POINTOPOINT)
+         *type = MIB_IF_TYPE_PPP;
+ 
++wireless:
+ #ifdef HAVE_LINUX_WIRELESS_H
+     if (*type == MIB_IF_TYPE_ETHERNET)
+     {
+@@ -307,6 +350,86 @@ static struct if_entry *add_entry( UINT index, char *name )
+     return entry;
+ }
+ 
++/* Android apps may not use netlink, which getifaddrs() needs; build the IPv4
++ * part of its list from SIOCGIFCONF instead. Freed with nsi_freeifaddrs(). */
++static char ifconf_list;
++
++int nsi_getifaddrs( struct ifaddrs **list )
++{
++    struct entry { struct ifaddrs ifa; struct sockaddr_in addr, mask; char name[IFNAMSIZ]; } *entries;
++    struct ifreq reqs[32];
++    struct ifconf conf;
++    int fd, i, count;
++
++    if (!getifaddrs( list )) return 0;
++    if (errno != EACCES && errno != EPERM) return -1;
++
++    if ((fd = socket( PF_INET, SOCK_DGRAM, 0 )) == -1) return -1;
++    conf.ifc_len = sizeof(reqs);
++    conf.ifc_req = reqs;
++    if (ioctl( fd, SIOCGIFCONF, &conf ) || !(count = conf.ifc_len / sizeof(*reqs)) ||
++        !(entries = calloc( count, sizeof(*entries) )))
++    {
++        close( fd );
++        return -1;
++    }
++    for (i = 0; i < count; i++)
++    {
++        struct ifreq req = reqs[i];
++
++        memcpy( entries[i].name, reqs[i].ifr_name, IFNAMSIZ - 1 );
++        memcpy( &entries[i].addr, &reqs[i].ifr_addr, sizeof(entries[i].addr) );
++        entries[i].mask.sin_family = AF_INET;
++        if (!ioctl( fd, SIOCGIFNETMASK, &req )) memcpy( &entries[i].mask, &req.ifr_netmask, sizeof(entries[i].mask) );
++        req = reqs[i];
++        if (!ioctl( fd, SIOCGIFFLAGS, &req )) entries[i].ifa.ifa_flags = req.ifr_flags;
++        entries[i].ifa.ifa_name = entries[i].name;
++        entries[i].ifa.ifa_addr = (struct sockaddr *)&entries[i].addr;
++        entries[i].ifa.ifa_netmask = (struct sockaddr *)&entries[i].mask;
++        entries[i].ifa.ifa_data = &ifconf_list;
++        entries[i].ifa.ifa_next = i + 1 < count ? &entries[i + 1].ifa : NULL;
++    }
++    close( fd );
++    *list = &entries[0].ifa;
++    return 0;
++}
++
++void nsi_freeifaddrs( struct ifaddrs *list )
++{
++    if (list && list->ifa_data == &ifconf_list) free( list );
++    else freeifaddrs( list );
++}
++
++/* Android apps may not list links over netlink, which if_nameindex() needs;
++ * SIOCGIFCONF still lists the interfaces that have an IPv4 address. */
++static unsigned int update_if_table_ifconf( void )
++{
++    unsigned int append_count = 0;
++    struct ifreq reqs[32], *req;
++    struct ifconf conf;
++    int fd;
++
++    if ((fd = socket( PF_INET, SOCK_DGRAM, 0 )) == -1) return 0;
++    conf.ifc_len = sizeof(reqs);
++    conf.ifc_req = reqs;
++    if (ioctl( fd, SIOCGIFCONF, &conf ))
++    {
++        ERR( "SIOCGIFCONF failed, errno %d.\n", errno );
++        close( fd );
++        return 0;
++    }
++    for (req = reqs; (char *)(req + 1) <= (char *)reqs + conf.ifc_len; req++)
++    {
++        struct ifreq index_req = *req;
++
++        if (ioctl( fd, SIOCGIFINDEX, &index_req )) continue;
++        if (!find_entry_from_index( index_req.ifr_ifindex ) && add_entry( index_req.ifr_ifindex, req->ifr_name ))
++            ++append_count;
++    }
++    close( fd );
++    return append_count;
++}
++
+ static unsigned int update_if_table( void )
+ {
+     struct if_nameindex *indices, *entry;
+@@ -315,6 +438,7 @@ static unsigned int update_if_table( void )
+     indices = if_nameindex();
+     if (!indices)
+     {
++        if (errno == EACCES || errno == EPERM) return update_if_table_ifconf();
+         ERR( "if_nameindex failed, errno %d.\n", errno );
+         return 0;
+     }
+diff --git a/dlls/nsiproxy.sys/tcp.c b/dlls/nsiproxy.sys/tcp.c
+index 0b3a8ab5..98d993a4 100644
+--- a/dlls/nsiproxy.sys/tcp.c
++++ b/dlls/nsiproxy.sys/tcp.c
+@@ -231,7 +231,7 @@ struct ipv6_addr_scope *get_ipv6_addr_scope_table( unsigned int *size )
+     {
+         struct ifaddrs *addrs, *cur;
+ 
+-        if (getifaddrs( &addrs ) == -1)  goto failed;
++        if (nsi_getifaddrs( &addrs ) == -1)  goto failed;
+ 
+         for (cur = addrs; cur; cur = cur->ifa_next)
+         {
+@@ -246,7 +246,7 @@ struct ipv6_addr_scope *get_ipv6_addr_scope_table( unsigned int *size )
+                 else table_size *= 2;
+                 if (!(new_table = realloc( table, table_size * sizeof(table[0]) )))
+                 {
+-                    freeifaddrs( addrs );
++                    nsi_freeifaddrs( addrs );
+                     goto failed;
+                 }
+                 table = new_table;
+@@ -258,7 +258,7 @@ struct ipv6_addr_scope *get_ipv6_addr_scope_table( unsigned int *size )
+             entry->scope = sin6->sin6_scope_id;
+         }
+ 
+-        freeifaddrs( addrs );
++        nsi_freeifaddrs( addrs );
+     }
+ #else
+     FIXME( "not implemented\n" );
+diff --git a/dlls/nsiproxy.sys/unix_private.h b/dlls/nsiproxy.sys/unix_private.h
+index 170bdba6..1e59d10f 100644
+--- a/dlls/nsiproxy.sys/unix_private.h
++++ b/dlls/nsiproxy.sys/unix_private.h
+@@ -179,3 +179,6 @@ static inline int ascii_strcasecmp( const char *s1, const char *s2 )
+ 
+ NTSTATUS icmp_get_reply( void *args );
+ NTSTATUS icmp_send_echo( void *args );
++struct ifaddrs;
++int nsi_getifaddrs( struct ifaddrs **list );
++void nsi_freeifaddrs( struct ifaddrs *list );
+diff --git a/dlls/ntdll/unix/system.c b/dlls/ntdll/unix/system.c
+index aaae9a2f..e8078218 100644
+--- a/dlls/ntdll/unix/system.c
++++ b/dlls/ntdll/unix/system.c
+@@ -2208,13 +2208,27 @@ static void create_smbios_processors( struct smbios_buffer *buf )
+ 
+ #ifdef linux
+ 
++/* Machines without DMI (Android) can provide the same files in WINE_DMI_DIR. */
++static FILE *open_dmi_file( const char *path )
++{
++    const char *dir = getenv( "WINE_DMI_DIR" ), *name = strrchr( path, '/' ) + 1;
++    char *alt;
++    FILE *file;
++
++    if ((file = fopen( path, "r" )) || !dir || !*dir) return file;
++    if (asprintf( &alt, "%s/%s", dir, name ) == -1) return NULL;
++    file = fopen( alt, "r" );
++    free( alt );
++    return file;
++}
++
+ static const char *get_smbios_string( const char *path, char *str, size_t size )
+ {
+     FILE *file;
+     size_t len;
+ 
+     str[0] = 0;
+-    if (!(file = fopen(path, "r"))) return str;
++    if (!(file = open_dmi_file( path ))) return str;
+ 
+     len = fread( str, 1, size - 1, file );
+     fclose( file );
+@@ -2236,10 +2250,17 @@ static GUID *get_system_uuid( GUID *uuid )
+         0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,        /* 0x50 */
+         0,10,11,12,13,14,15                     /* 0x60 */
+     };
++    FILE *file;
+     int fd;
+ 
+     memset( uuid, 0xff, sizeof(*uuid) );
+-    if ((fd = open( "/var/lib/dbus/machine-id", O_RDONLY )) != -1)
++    fd = open( "/var/lib/dbus/machine-id", O_RDONLY );
++    if (fd == -1 && (file = open_dmi_file( "/var/lib/dbus/machine-id" )))
++    {
++        fd = dup( fileno( file ));
++        fclose( file );
++    }
++    if (fd != -1)
+     {
+         unsigned char buf[32], *p = buf;
+         if (read( fd, buf, sizeof(buf) ) == sizeof(buf))
+-- 
+2.56.0
+

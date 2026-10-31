@@ -1,0 +1,32 @@
+From 0420be6ae92a94425026702b1e8173248edaf9b1 Mon Sep 17 00:00:00 2001
+From: Jabern <Jabern@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 16:10:43 +0300
+Subject: [PATCH 41/43] winex11: Ignore BadWindow on Map/UnmapWindow of windows
+ destroyed by another process.
+
+Seen with Termux:X11 on Android: Rhino was killed by Xlib's default handler
+(X_UnmapWindow on a window id owned by another client). Upstream already
+ignores BadWindow for SetInputFocus, ChangeWindowAttributes, ConfigureWindow
+and SendEvent for the same reason.
+---
+ dlls/winex11.drv/x11drv_main.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/winex11.drv/x11drv_main.c b/dlls/winex11.drv/x11drv_main.c
+index a5d7d8d3..9be745df 100644
+--- a/dlls/winex11.drv/x11drv_main.c
++++ b/dlls/winex11.drv/x11drv_main.c
+@@ -207,7 +207,9 @@ static inline BOOL ignore_error( Display *display, XErrorEvent *event )
+     if ((event->request_code == X_SetInputFocus ||
+          event->request_code == X_ChangeWindowAttributes ||
+          event->request_code == X_ConfigureWindow ||
+-         event->request_code == X_SendEvent) &&
++         event->request_code == X_SendEvent ||
++         event->request_code == X_MapWindow ||
++         event->request_code == X_UnmapWindow) &&
+         (event->error_code == BadMatch ||
+          event->error_code == BadWindow)) return TRUE;
+ 
+-- 
+2.56.0
+

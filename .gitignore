@@ -1,0 +1,11 @@
+# downloaded / generated, not source
+termux-glibc/sysroot/
+termux-glibc/pkgs/
+termux-glibc/db/
+termux-glibc/gpkg.db
+package/*.tar.zst
+package/*.apk
+*.dll
+*.exe
+*.so
+*.dmp

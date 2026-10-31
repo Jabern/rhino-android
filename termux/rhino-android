@@ -1,0 +1,118 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# Rhino on Android, from Termux: our Wine (rhino-linux patches, ARM64EC) with
+# FEX, on Termux's glibc, without proot. Needs Termux:X11 running (:0); the
+# `rhino` command starts it.
+#
+#   rhino-android                   start Rhino 8
+#   rhino-android --install BUNDLE  new prefix + Rhino from its installer
+#   rhino-android --stop            close Rhino and everything Wine runs
+#   rhino-android --wine ARGS...    run any Wine command in the prefix
+#
+# RHINO_GL=llvmpipe draws on the CPU instead of the GPU (VirGL).
+set -e
+G=$PREFIX/glibc
+W=$G/opt/wine-rhino
+export WINEPREFIX=${WINEPREFIX:-$HOME/.wine-rhino8}
+export DISPLAY=${DISPLAY:-:0}
+export WINEDEBUG=${WINEDEBUG:--all}
+export PATH=$W/bin:$PATH
+# glibc programs must not get Termux's bionic exec hook
+unset LD_PRELOAD
+
+# Android has no DMI: describe this machine to Wine (and so to Rhino's
+# licensing) from its own Android properties.
+D=$HOME/.rhino-android/dmi
+mkdir -p "$D"
+[ -s "$D/machine-id" ] || tr -d '-' < /proc/sys/kernel/random/uuid > "$D/machine-id"
+serial=$(cut -c1-12 "$D/machine-id" | tr a-f A-F)
+vendor=$(getprop ro.product.manufacturer)
+model=$(getprop ro.product.model)
+build=$(getprop ro.build.display.id)
+board=$(getprop ro.board.platform)
+w() { printf '%s\n' "$2" > "$D/$1"; }
+w sys_vendor "$vendor";      w product_name "$model";   w product_version "1.0"
+w product_sku "$model";      w product_family "$(getprop ro.product.name)"
+w product_serial "$serial";  w board_vendor "$vendor";  w board_name "$board"
+w board_version "1.0";       w board_serial "$serial";  w board_asset_tag "none"
+w bios_vendor "$vendor";     w bios_version "$build"
+w bios_date "$(date -d "@$(getprop ro.build.date.utc)" +%m/%d/%Y 2>/dev/null || echo 01/01/2026)"
+w chassis_type 11;           w chassis_vendor "$vendor"; w chassis_version "1.0"
+w chassis_serial "$serial";  w chassis_tag "none"
+export WINE_DMI_DIR=$D
+
+# same .NET settings as rhino-linux's launcher
+export DOTNET_gcServer=0 DOTNET_TieredPGO=1 DOTNET_TC_QuickJitForLoops=1 DOTNET_ReadyToRun=1
+export DOTNET_GCDynamicAdaptationMode=1 DOTNET_EnableWriteXorExecute=0
+export WINEDLLOVERRIDES="winemenubuilder.exe=d${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+
+# Viewport on the GPU through VirGL when its server runs. VirGL offers OpenGL
+# 2.1, Rhino 8 asks for 4.1: report 4.5 (basic display modes work).
+if [ "${RHINO_GL:-virgl}" = virgl ] && [ -S "$PREFIX/tmp/.virgl_test" ]; then
+    export GALLIUM_DRIVER=virpipe MESA_GL_VERSION_OVERRIDE=4.5COMPAT MESA_GLSL_VERSION_OVERRIDE=450
+fi
+
+stop() {
+    wineserver -k 2>/dev/null || true
+    sleep 1
+}
+
+win() { printf 'Z:%s' "$(printf '%s' "$1" | tr / '\\')"; }
+
+case "$1" in
+--wine)
+    shift
+    exec wine "$@"
+    ;;
+--stop)
+    stop
+    ;;
+--install)
+    bundle=$2
+    [ -f "$bundle" ] || { echo "usage: rhino-android --install rhino_en-us_8.x.exe" >&2; exit 1; }
+    stop
+    wineboot -i
+    # FEX: x86-64 code (ARM64EC) and 32-bit x86 code (WoW64)
+    wine reg add 'HKLM\Software\Microsoft\Wow64\amd64' /ve /d libarm64ecfex.dll /f
+    wine reg add 'HKLM\Software\Microsoft\Wow64\x86' /ve /d libwow64fex.dll /f
+    # wineboot only sets up 32-bit x86 (syswow64) once it can find the emulator
+    rm -f "$WINEPREFIX/.update-timestamp"
+    wineboot -u
+    wine winecfg /v win10
+    # WPF panels in software: through wined3d on VirGL they crash Rhino
+    wine reg add 'HKCU\Software\Microsoft\Avalon.Graphics' /v DisableHWAcceleration /t REG_DWORD /d 1 /f
+    # Wine 11 claims a VC++ runtime, so Rhino's installer skips it: no mfc140u
+    for a in x64 x86; do
+        f=$HOME/.rhino-android/vc_redist.$a.exe
+        [ -s "$f" ] || curl -fsSL --retry 3 -o "$f" "https://aka.ms/vs/17/release/vc_redist.$a.exe"
+        wine "$f" /install /quiet /norestart || true
+    done
+    wine "$bundle" /passive /norestart || true
+    sys="$WINEPREFIX/drive_c/Program Files/Rhino 8/System"
+    if [ ! -f "$sys/Rhino.exe" ]; then
+        # The bundle's own rhino.msi step fails under emulation (its
+        # IsRhinoInstalled custom action leaves its property unset). Take
+        # rhino.msi out of the bundle and give it what that action sets on x86-64.
+        lay=$HOME/.rhino-android/layout
+        rm -rf "$lay"; mkdir -p "$lay"
+        wine "$bundle" -layout "$(win "$lay")" -quiet || true
+        msi=$(find "$lay" -iname rhino.msi | head -1)
+        [ -f "$msi" ] || { echo "rhino.msi not found in the installer" >&2; exit 1; }
+        wine msiexec /i "$(win "$msi")" /qn RHINO_80_INSTALLED=0 RHINO_50_X64_INSTALLED=0 \
+            RHINO_50_X86_INSTALLED=0 RMA_LICENSEISINSTALLED=0 ARPSYSTEMCOMPONENT=1 \
+            DEFER_NET48_REBOOT=1 ENABLE_AUTOMATIC_UPDATES=0 SEND_STATISTICS=0 INSTALL_EN=1
+        rm -rf "$lay"
+    fi
+    # Edge Update never exits and keeps wineserver alive
+    for svc in edgeupdate edgeupdatem; do
+        wine reg add "HKLM\\System\\CurrentControlSet\\Services\\$svc" /v Start /t REG_DWORD /d 4 /f || true
+    done
+    stop
+    [ -f "$sys/Rhino.exe" ] && echo "Rhino 8 installed." || { echo "Rhino.exe not found" >&2; exit 1; }
+    ;;
+*)
+    # one Rhino at a time: a second one only waits for the first and doubles memory use
+    stop
+    cd "$WINEPREFIX/drive_c/Program Files/Rhino 8/System"
+    exec wine Rhino.exe "$@"
+    ;;
+esac

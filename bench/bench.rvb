@@ -1,0 +1,15 @@
+' Viewport benchmark: 216 shaded spheres, TestMaxSpeed, command history to C:\bench-result.txt
+Option Explicit
+Rhino.Command "_-Sphere 0,0,0 4", False
+Rhino.Command "_SelLast", False
+Rhino.Command "_-Array 6 6 6 10 10 10", False
+Rhino.Command "_SelNone", False
+Rhino.Command "_-SetMaximizedViewport Perspective", False
+Rhino.Command "_-SetDisplayMode _Viewport=_Active _Mode=_Shaded", False
+Rhino.Command "_Zoom _All _Extents", False
+Rhino.Command "_TestMaxSpeed", False
+Dim fso, f
+Set fso = CreateObject("Scripting.FileSystemObject")
+Set f = fso.CreateTextFile("C:\bench-result.txt", True)
+f.Write Rhino.CommandHistory
+f.Close

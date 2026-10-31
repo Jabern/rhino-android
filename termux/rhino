@@ -1,0 +1,17 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# Start the display (Termux:X11, Openbox, VirGL server) and Rhino 8 on it.
+termux-wake-lock 2>/dev/null
+if ! pgrep -f 'com.termux.x11 :0' >/dev/null; then
+    setsid -f sh -c "termux-x11 :0 > ~/.rhino-android/x11.log 2>&1"
+    sleep 3
+fi
+am broadcast -a com.termux.x11.CHANGE_PREFERENCE -p com.termux.x11 \
+    --es displayResolutionMode custom --es displayResolutionCustom 1920x1080 \
+    --es forceOrientation landscape --es fullscreen true >/dev/null 2>&1
+am start -n com.termux.x11/.MainActivity >/dev/null 2>&1
+pgrep -x openbox >/dev/null || DISPLAY=:0 setsid -f sh -c "openbox > ~/.rhino-android/openbox.log 2>&1"
+pgrep -f virgl_test_server_android >/dev/null ||
+    setsid -f sh -c "virgl_test_server_android > ~/.rhino-android/virgl.log 2>&1"
+sleep 1
+DISPLAY=:0 setsid -f sh -c "rhino-android > ~/.rhino-android/rhino.log 2>&1"
+echo "Rhino is starting on Termux:X11 (about a minute). Log: ~/.rhino-android/rhino.log"

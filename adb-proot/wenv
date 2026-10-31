@@ -1,0 +1,13 @@
+#!/bin/sh
+# inside proot: run a command with the Rhino Wine environment.
+# RHINO_WINE=ours: our Wine (/opt/wine-rhino, prefix-rhino8-ours);
+# otherwise Hangover (/usr, prefix-rhino8).
+if [ "$RHINO_WINE" = ours ]; then
+    export PATH=/opt/wine-rhino/bin:$PATH WINEPREFIX=${WINEPREFIX:-/root/prefix-rhino8-ours}
+else
+    export WINEPREFIX=${WINEPREFIX:-/root/prefix-rhino8}
+    export HODLL64=libarm64ecfex.dll HODLL=libwow64fex.dll
+fi
+export DISPLAY=${DISPLAY:-:0} WINEDEBUG=${WINEDEBUG:--all}
+export LD_PRELOAD=/usr/local/lib/libabstractsock.so
+exec "$@"

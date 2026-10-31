@@ -1,0 +1,43 @@
+From d7abff2045985d73fe877061564e422efda41dd8 Mon Sep 17 00:00:00 2001
+From: Jabern <Jabern@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 16:10:43 +0300
+Subject: [PATCH 42/43] ntdll, server: Allow the server directory in the prefix
+ outside __ANDROID__ builds.
+
+WINE_SERVER_DIR_IN_PREFIX (a build flag, off by default) selects the existing
+Android branch: $WINEPREFIX/.wineserver instead of /tmp/.wine-UID. Needed for
+the Termux glibc build, which has no /tmp.
+---
+ dlls/ntdll/unix/server.c | 2 +-
+ server/request.c         | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/dlls/ntdll/unix/server.c b/dlls/ntdll/unix/server.c
+index 389a1928..e2688bfb 100644
+--- a/dlls/ntdll/unix/server.c
++++ b/dlls/ntdll/unix/server.c
+@@ -1305,7 +1305,7 @@ static const char *init_server_dir( dev_t dev, ino_t ino )
+ {
+     char *dir = NULL;
+ 
+-#ifdef __ANDROID__  /* there's no /tmp dir on Android */
++#if defined(__ANDROID__) || defined(WINE_SERVER_DIR_IN_PREFIX)  /* there's no /tmp dir on Android */
+     asprintf( &dir, "%s/.wineserver/server-%llx-%llx", config_dir, (unsigned long long)dev, (unsigned long long)ino );
+ #else
+     asprintf( &dir, "/tmp/.wine-%u/server-%llx-%llx", getuid(), (unsigned long long)dev, (unsigned long long)ino );
+diff --git a/server/request.c b/server/request.c
+index 6d55c08f..b59fc3dd 100644
+--- a/server/request.c
++++ b/server/request.c
+@@ -636,7 +636,7 @@ static char *create_server_dir( int force )
+ 
+     /* create the base directory if needed */
+ 
+-#ifdef __ANDROID__  /* there's no /tmp dir on Android */
++#if defined(__ANDROID__) || defined(WINE_SERVER_DIR_IN_PREFIX)  /* there's no /tmp dir on Android */
+     if (asprintf( &base_dir, "%s/.wineserver", config_dir ) == -1)
+         fatal_error( "out of memory\n" );
+ #else
+-- 
+2.56.0
+
